@@ -7,10 +7,6 @@ from tinygrad.nn import optim
 from tinygrad.helpers import getenv
 from tinygrad.state import get_parameters
 
-GPU = getenv("GPU")
-QUICK = getenv("QUICK")
-DEBUG = getenv("DEBUG")
-
 def l2_norm(x):
   if len(x.shape):
     x = x.reshape((x.shape[0],-1))
@@ -150,29 +146,15 @@ class DistanceWeightedMarginLoss:
     self.nonzero_loss_cutoff = nonzero_loss_cutoff
     self.normalize = normalize
 
-    mask = np.ones((batch_size, batch_size))
+    mask = np.ones((batch_size, batch_size)).astype(np.float32)
     for i in range(0,batch_size, batch_k):
       mask[i:i+batch_k, i:i+batch_k] = float(0)
 
     self.mask_uniform_probs = mask *(1.0/(batch_size-batch_k))
     self.mask = Tensor(mask)
 
-  # pylint: disable=C0111,R0914,W0221,R0913
-  def forward(self, x, y, beta_in):
-    """
-    deriving the loss for the model's outputs
-
-    Args:
-    -----
-    x: Tensor
-    y: Tensor
-    beta_in: Tensor
-
-    Returns:
-    --------
-    loss: Tensor
-    pair_cnt: Tensor
-    """
+  # can be done w/out numpy
+  def get_distance(self, x):
     k = self.batch_k
     n, d = x.shape
     distance = get_distance(x)
@@ -182,7 +164,6 @@ class DistanceWeightedMarginLoss:
     log_weights = ((2.0 - float(d)) * Tensor.log(distance)
              - (float(d - 3) / 2) * Tensor.log(1.0 - 0.25 * (distance ** 2.0)))
     weights = Tensor.exp(log_weights - Tensor.max(log_weights))
-    # grad works here
 
     if x.device != weights.device:
       weights = weights.to(x.device)
@@ -191,30 +172,39 @@ class DistanceWeightedMarginLoss:
 
     weights_sum = Tensor.sum(weights, axis=1, keepdim=True)
     weights = weights / weights_sum
+    return weights_sum, weights, n
 
+  # needs numpy
+  def random_sample(self, weights_sum, weights, n):
     a_indices = []
     p_indices = []
     n_indices = []
 
-    np_weights = weights.detach().numpy()
+    # this might throw it thought a loop
+    np_weights = weights.realize().numpy()
+    np_weights_sum = weights_sum.realize().numpy()
     for i in range(n):
-      block_idx = i // k
+      block_idx = i // self.batch_k
 
-      if weights_sum[i] != 0:
+      if np_weights_sum[i] != 0:
         try:
-          n_indices +=  np.random.choice(n, k-1, p=np_weights[i]).tolist()
+          n_indices +=  np.random.choice(n, self.batch_k-1, p=np_weights[i]).tolist()
         except ValueError: #ValueError: probabilities do not sum to 1 
           to_add = 1-np_weights[i].sum()
           idx = np.argmin(np_weights[i])
           np_weights[i][idx]+=to_add
-          n_indices +=  np.random.choice(n, k-1, p=np_weights[i]).tolist()
+          n_indices +=  np.random.choice(n, self.batch_k-1, p=np_weights[i]).tolist()
       else:
-        n_indices +=  np.random.choice(n, k-1, p=self.mask_uniform_probs[i]).tolist()
-      for j in range(block_idx * k, (block_idx + 1)*k):
+        n_indices +=  np.random.choice(n, self.batch_k-1, p=self.mask_uniform_probs[i]).tolist()
+      for j in range(block_idx * self.batch_k, (block_idx + 1)*self.batch_k):
         if j != i:
           a_indices.append(i)
           p_indices.append(j)
 
+    return a_indices, p_indices, n_indices
+
+  def get_loss(self, x, y, beta_in, a_indices, p_indices, n_indices):
+    # this so weird and can be done a bit better
     total_loss = Tensor(0.0)
     pair_cnt = Tensor(0)
     beta_reg_loss = Tensor(0)
@@ -247,7 +237,10 @@ class DistanceWeightedMarginLoss:
     return loss, pair_cnt
 
   def __call__(self, x, y, beta_in):
-    return self.forward(x, y, beta_in)
+    weights_sum, weights, n = self.get_distance(x)
+    a_indices, p_indices, n_indices = self.random_sample(weights_sum, weights, n)
+    loss, pair_cnt = self.get_loss(x, y, beta_in, a_indices, p_indices, n_indices)
+    return loss, pair_cnt
 
 # pylint: disable=R0903
 class MarginLoss:

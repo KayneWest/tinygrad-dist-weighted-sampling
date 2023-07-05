@@ -6,14 +6,13 @@ import logging
 import time
 
 import numpy as np
-from bottleneck import argpartition
 
 from data import cub200_iterator
 
 from tinygrad.tensor import Tensor
 from tinygrad.nn import optim
 from model import MarginNet, MarginLoss, ResNetFeats, get_distance, DistanceWeightedMarginLoss
-#from ..resnet import ResNet50
+from resnet import ResNet50
 from tinygrad.state import get_parameters
 from tinygrad.jit import TinyJit
 
@@ -95,7 +94,7 @@ def infrence_jitted(net, X):
   embeddings = net(X)
   return embeddings
 
-def train(net, epochs):
+def train(net, epochs, use_val=False):
   """Training function."""
   parameters = get_parameters(net)
   trainer = optim.AdamW(parameters, lr=opt.lr, wd=opt.wd, eps=1e-7)
@@ -145,15 +144,16 @@ def train(net, epochs):
     logging.info('[Epoch %d] training loss=%f'%(epoch, float(cumulative_loss.numpy())))
     logging.info('[Epoch %d] time cost: %f'%(epoch, time.time()-tic))
 
-    names, val_accs = test_faiss(net, val_data, epoch,
-                                     opt.save_dir, opt.save_model_prefix)
-    for name, val_acc in zip(names, val_accs):
-      logging.info('[Epoch %d] validation: %s=%f'%(epoch, name, val_acc))
+    if use_val:
+        names, val_accs = test_faiss(net, val_data, epoch,
+                                        opt.save_dir, opt.save_model_prefix)
+        for name, val_acc in zip(names, val_accs):
+            logging.info('[Epoch %d] validation: %s=%f'%(epoch, name, val_acc))
 
-    if val_accs[0] > best_val:
-      best_val = val_accs[0]
-      logging.info('Saving %s.' % opt.save_model_prefix)
-      # net.save('%s.params' % opt.save_model_prefix)
+        if val_accs[0] > best_val:
+            best_val = val_accs[0]
+            logging.info('Saving %s.' % opt.save_model_prefix)
+            # net.save('%s.params' % opt.save_model_prefix)
   return best_val
 
 
@@ -353,12 +353,12 @@ Cell In[6], line 187
     186   train_data, val_data = cub200_iterator(opt.data_path, opt.batch_k, batch_size, (3, 224, 224))
 --> 187   best_val_recall = train(net, opt.epochs)
     188   print('Best validation Recall@1: %.2f.' % best_val_recall)
-    191 '''
+    191 
     192 I also got this problem and solve it, maybe it will help someone:
     193 
    (...)
     349 AssertionError: didn't JIT anything!
-    350 '''
+    350 
 
 Cell In[6], line 134, in train(net, epochs)
     132 trainer_beta.zero_grad()
@@ -447,6 +447,12 @@ Build on <pyopencl.Device 'NVIDIA GeForce RTX 3070' on 'NVIDIA CUDA' at 0x168191
 (options: -I /home/mkrzus/anaconda3/envs/lightning/lib/python3.10/site-packages/pyopencl/cl)
 (source saved as /tmp/tmp5dp67i3l.cl)
 
+
+1. does this only fail if we do validation?
+1a. lets see how long it takes to 'train'
+2. make sure the loss is correct... it doesn't seem ok bc we had a negative loss, that seems off
+3. diagnose problem
+4. create pr/issue for bugs that you can't fix
 
 
 '''
