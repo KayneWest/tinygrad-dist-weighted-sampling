@@ -11,7 +11,7 @@ from data import cub200_iterator
 
 from tinygrad.tensor import Tensor
 from tinygrad.nn import optim
-from model import MarginNet, DistanceWeightedMarginLoss
+from model import MarginNet, DistanceWeightedMarginLoss, MarginLoss
 from resnet import ResNet50
 from tinygrad.state import get_parameters
 from tinygrad.jit import TinyJit
@@ -26,7 +26,7 @@ parser.add_argument('--data-path', type=str, default='cub200_data/CUB_200_2011',
                     help='path of data.')
 parser.add_argument('--embed-dim', type=int, default=128,
                     help='dimensionality of image embedding. default is 128.')
-parser.add_argument('--batch-size', type=int, default=10,
+parser.add_argument('--batch-size', type=int, default=20,
                     help='training batch size per device (CPU/GPU). default is 70.')
 parser.add_argument('--batch-k', type=int, default=5,
                     help='number of images per class in a batch. default is 5.')
@@ -100,6 +100,30 @@ def train_step_jitted(net, margin_loss, beta, X, Y, group_trainer):
   return losses.realize()
 
 @TinyJit
+def inference(net, margin_loss, data):
+    embeddings = net(data)
+    weights_sum, weights, n = margin_loss.get_distance_short(embeddings)
+    return embeddings.realize(), weights_sum.realize(), weights.realize(), n
+
+#@TinyJit
+def loss_function(margin_loss, group_trainer, embeddings, label, beta, a_indices, p_indices, n_indices):
+    losses = margin_loss.get_loss_(embeddings, label, beta, a_indices, p_indices, n_indices)
+    group_trainer.zero_grad()
+    losses.backward()
+    group_trainer.step()
+    return losses.realize()
+
+@TinyJit
+def jit_train(net, margin_loss, beta, X, Y, group_trainer):
+  a_indices, p_indices, n_indices, embeddings = net.sample(X)
+  losses = margin_loss(embeddings, Y, beta, a_indices, p_indices, n_indices)
+  group_trainer.zero_grad()
+  losses.backward()
+  group_trainer.step()
+  return losses.realize()
+
+
+@TinyJit
 def infrence_jitted(net, X):
   # doesn't work when training=True...
   embeddings = net(X)
@@ -114,15 +138,23 @@ def train(net, epochs, use_val=False):
   
   params_feature_detector = get_parameters(net.feature_detector)
   params_embeddings = get_parameters(net.dense)
-  
-  group_trainer = OptimizerGroup()
-  # dampen net
-  group_trainer.append(optim.AdamW(params_feature_detector, lr= opt.lr * 0.01, wd=opt.wd, eps=1e-7))
-  group_trainer.append(optim.AdamW(params_embeddings, lr= opt.lr, wd=opt.wd, eps=1e-7))
-  if opt.lr_beta > 0.0:
-    group_trainer.append(optim.SGD([beta], lr = opt.lr_beta, momentum = 0.9))
+  use_optimizer_group = True
+  if use_optimizer_group:
+    group_trainer = OptimizerGroup()
+    # dampen net
+    group_trainer.append(optim.AdamW(params_feature_detector, lr= opt.lr * 0.01, wd=opt.wd, eps=1e-7))
+    group_trainer.append(optim.AdamW(params_embeddings, lr= opt.lr, wd=opt.wd, eps=1e-7))
+    if opt.lr_beta > 0.0:
+        group_trainer.append(optim.SGD([beta], lr = opt.lr_beta, momentum = 0.9))
+  else:
+    group_trainer = []
+    # dampen net
+    group_trainer.append(optim.AdamW(params_feature_detector, lr= opt.lr * 0.01, wd=opt.wd, eps=1e-7))
+    group_trainer.append(optim.AdamW(params_embeddings, lr= opt.lr, wd=opt.wd, eps=1e-7))
+    if opt.lr_beta > 0.0:
+        group_trainer.append(optim.SGD([beta], lr = opt.lr_beta, momentum = 0.9))
 
-  margin_loss = DistanceWeightedMarginLoss(embed_dim=opt.embed_dim, batch_size=opt.batch_size, margin=opt.margin, nu=opt.nu, batch_k=opt.batch_k)
+  margin_loss = MarginLoss(embed_dim=opt.embed_dim, batch_size=opt.batch_size, margin=opt.margin, nu=opt.nu, batch_k=opt.batch_k)
   Tensor.training = True
   
   best_val = 0.0
@@ -151,16 +183,26 @@ def train(net, epochs, use_val=False):
         data =  Tensor(data, requires_grad=False)
         label = Tensor(label, requires_grad=False)
     
-      #embeddings = net(data)
-      embeddings = infrence_jitted(net, data) #Nothing to Jit..?
-      losses = margin_loss.get(embeddings, label, beta)
-      losses = losses[0] if isinstance(losses, tuple) else losses
+      y_r = label.realize().numpy()
 
-      group_trainer.zero_grad()
-      # compute gradient and do SGD steps
-      losses.backward()
-      group_trainer.step()
+      losses = jit_train(net, margin_loss, beta, data, y_r, group_trainer)
+
+      '''
+      a_indices, p_indices, n_indices, embeddings = net.sample(data)
+      losses = margin_loss(embeddings, label, beta, a_indices, p_indices, n_indices)
+      if use_optimizer_group:
+        group_trainer.zero_grad()
+        # compute gradient and do SGD steps
+        losses.backward()
+        group_trainer.step()
+      else:
+        for group in group_trainer:
+          group.zero_grad()
+        losses.backward()
+        for group in group_trainer:
+          group.step()
       # subprocess.call('nvidia-smi')
+      '''
       '''
       if not hack:
         losses = train_step_jitted(net, margin_loss, beta, data, label, group_trainer)
@@ -169,9 +211,11 @@ def train(net, epochs, use_val=False):
       else:
         losses = train_step_jitted(net, margin_loss, beta, data, label, group_trainer)
       '''
+      
       cumulative_loss = cumulative_loss + losses.realize()
       
       if (i+1) % opt.log_interval == 0:
+      #if True:
         diff = cumulative_loss - prev_loss
         print(f'[Epoch {epoch}, Iter {i+1}] training loss={float(diff.numpy())}')
         prev_loss = cumulative_loss
@@ -201,20 +245,145 @@ if __name__ == '__main__':
 
   steps = [int(step) for step in opt.steps.split(',')]
 
-  net = MarginNet(opt.embed_dim, opt.batch_size)
+  net = MarginNet(opt.embed_dim, opt.batch_size, opt.batch_k)
   net.load_basenet_features() # load the basenet
   beta = Tensor(np.ones((100,)).astype(np.float32) * opt.beta)
 
   # Get iterators.
   train_data, val_data = cub200_iterator(opt.data_path, opt.batch_k, batch_size, (3, 224, 224))
 
-
-
-
   best_val_recall = train(net, opt.epochs)
   print('Best validation Recall@1: %.2f.' % best_val_recall)
 
 
+
+
+
+class LargeJit:
+  def __init__(self, fxn:Callable):
+    self.fxn: Callable = fxn
+    self.cnt: int = 0
+    self.jit_cache: List[Tuple[Callable, Any]] = []  # TODO: Any should be List[RawBuffer], but this fails
+    self.ret: Any = None
+    self.input_replace: Dict[Tuple[int, int], Tuple[Union[int, str], int, DType]]= {}   # (kernel_number, buffer_number) -> (input_name, expected_size, expected_type)
+
+  # add support for instance methods
+  def __get__(self, obj, objtype): return functools.partial(self.__call__, obj)
+
+  def __call__(self, *args, **kwargs) -> Any:
+    self.aargs = [x for x in args]
+    self.kwargs = [x for x in kwargs]
+    if Device.DEFAULT not in ["GPU", "CLANG", "METAL", "CUDA", "HIP"]: return self.fxn(*args, **kwargs)  # only jit on the GPU codegen
+    # NOTE: this cast is needed since although we know realize will create a ".realized" DeviceBuffer, the type checker doesn't
+    input_rawbuffers: Dict[Union[int, str], RawBuffer] = {cast(Union[int, str], k):cast(RawBuffer, v.realize().lazydata.realized) for k,v in itertools.chain(enumerate(args), kwargs.items()) if isinstance(v, Tensor)}
+    self.og_input_rawbuffers = input_rawbuffers
+    assert len(input_rawbuffers) != 0, "no inputs to JIT"
+    assert len(set(input_rawbuffers.values())) == len(input_rawbuffers), "duplicate inputs to JIT"
+    if self.cnt >= 2:
+      for (j,i),(input_name, expected_size, expected_type) in self.input_replace.items():
+        assert input_rawbuffers[input_name].size == expected_size and input_rawbuffers[input_name].dtype == expected_type, f"size or type mismatch in JIT, {input_rawbuffers[input_name]} != <{expected_size}, {expected_type}>"
+        self.jit_cache[j][1][i] = input_rawbuffers[input_name]
+      for prg, args in self.jit_cache: prg(args, jit=True)
+      for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
+    elif self.cnt == 1:
+      GlobalCounters.cache = []
+      self.ret = self.fxn(*args, **kwargs)
+      self.jit_cache = GlobalCounters.cache
+      GlobalCounters.cache = None
+      assert len(self.jit_cache) != 0, "didn't JIT anything!"
+      if DEBUG >= 1: print(f"JIT captured {len(self.jit_cache)} kernels with {len(input_rawbuffers)} inputs")
+
+      # get the inputs for replacement
+      for j,(prg,args) in enumerate(self.jit_cache):  # pylint: disable=E1133
+        for i,a in enumerate(args):
+          if a in input_rawbuffers.values():
+            self.input_replace[(j,i)] = [(k, v.size, v.dtype) for k,v in input_rawbuffers.items() if v == a][0]
+        #if prg.local_size is None: prg.local_size = prg.optimize_local_size(args, preserve_output=True)  # the JIT can optimize local
+      assert set([x[0] for x in self.input_replace.values()]) == set(input_rawbuffers.keys()), "some input tensors not found"
+      for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
+    elif self.cnt == 0:
+      #GlobalCounters.cache = []
+      self.ret = self.fxn(*args, **kwargs)
+      #self.jit_cache = GlobalCounters.cache
+      #GlobalCounters.cache = None
+    self.cnt += 1
+    return self.ret
+
+@LargeJit
+def train_jit(net, margin_loss, beta, X, Y, group_trainer):
+  embeddings = net(X)
+  #embeddings = infrence_jitted(net, data) #Nothing to Jit..?
+  losses = margin_loss(embeddings, Y, beta)
+  losses = losses[0] if isinstance(losses, tuple) else losses
+  group_trainer.zero_grad()
+  # compute gradient and do SGD steps
+  #trainer.zero_grad()
+  #trainer_beta.zero_grad()
+  losses.backward()
+  #trainer.step()
+  #trainer_beta.step()
+  group_trainer.step()
+  # subprocess.call('nvidia-smi')
+  return losses.realize()
+
+    input_rawbuffers: Dict[Union[int, str], RawBuffer] = {cast(Union[int, str], k):cast(RawBuffer, v.realize().lazydata.realized) for k,v in itertools.chain(enumerate(args), kwargs.items()) if isinstance(v, Tensor)}
+    assert len(input_rawbuffers) != 0, "no inputs to JIT"
+    assert len(set(input_rawbuffers.values())) == len(input_rawbuffers), "duplicate inputs to JIT"
+    if self.cnt >= 2:
+      for (j,i),(input_name, expected_size, expected_type) in self.input_replace.items():
+        assert input_rawbuffers[input_name].size == expected_size and input_rawbuffers[input_name].dtype == expected_type, f"size or type mismatch in JIT, {input_rawbuffers[input_name]} != <{expected_size}, {expected_type}>"
+        self.jit_cache[j][1][i] = input_rawbuffers[input_name]
+      for prg, args in self.jit_cache: prg(args, jit=True)
+      for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
+    elif self.cnt == 1:
+      GlobalCounters.cache = []
+      self.ret = self.fxn(*self.aargs, {})
+      self.jit_cache = GlobalCounters.cache
+      GlobalCounters.cache = None
+      assert len(self.jit_cache) != 0, "didn't JIT anything!"
+      if DEBUG >= 1: print(f"JIT captured {len(self.jit_cache)} kernels with {len(input_rawbuffers)} inputs")
+
+      # get the inputs for replacement
+      for j,(prg,args) in enumerate(self.jit_cache):  # pylint: disable=E1133
+        for i,a in enumerate(args):
+          if a in input_rawbuffers.values():
+            self.input_replace[(j,i)] = [(k, v.size, v.dtype) for k,v in input_rawbuffers.items() if v == a][0]
+        #if prg.local_size is None: prg.local_size = prg.optimize_local_size(args, preserve_output=True)  # the JIT can optimize local
+      assert set([x[0] for x in self.input_replace.values()]) == set(input_rawbuffers.keys()), "some input tensors not found"
+      for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
+    elif self.cnt == 0:
+      self.ret = self.fxn(*args, **kwargs)
+    self.cnt += 1
+    return self.ret
+
+
+#In [55]: input_rawbuffers
+Out[55]: 
+{2: buffer<100, dtypes.float>,
+ 3: buffer<1505280, dtypes.float>,
+ 4: buffer<10, dtypes.long>}
+
+In [56]: input_rawbuffers[4]
+Out[56]: buffer<10, dtypes.long>
+
+In [57]: input_rawbuffers[4]
+
+
+
+'''
+input_rawbuffers[4] is not in jit_cache during the first pass. 
+
+'''
+# get the inputs for replacement
+for j,(prg,args) in enumerate(self.jit_cache):  # pylint: disable=E1133
+  for i,a in enumerate(args):
+    if a in input_rawbuffers.values():
+      self.input_replace[(j,i)] = [(k, v.size, v.dtype) for k,v in input_rawbuffers.items() if v == a][0]
+    else:
+      self.Input_replace[(j,i)] = a
+
+
+'''
   def deepwalk(self):
     def _deepwalk(node, visited, nodes, fails):
       visited.add(node)
@@ -256,3 +425,4 @@ if __name__ == '__main__':
         print('fail')
         fails.append(node)
         return node
+'''
