@@ -518,13 +518,14 @@ class CUB200Iter(DataIter):
         Training data or testig data. Training batches are randomly sampled.
         Testing batches are loaded sequentially until reaching the end.
     """
-    def __init__(self, data_path, batch_k, batch_size, data_shape, is_train):
+    def __init__(self, data_path, batch_k, batch_size, data_shape, is_train, return_tensor=False):
         super(CUB200Iter, self).__init__(batch_size)
         self.data_shape = (batch_size,) + data_shape
         self.batch_size = batch_size
         self.provide_data = [('data', self.data_shape)]
         self.batch_k = batch_k
         self.is_train = is_train
+        self.return_tensor = return_tensor
 
         self.train_image_files = [[] for _ in range(100)]
         self.test_image_files = []
@@ -578,7 +579,10 @@ class CUB200Iter(DataIter):
         
         batch = np.concatenate(batch, axis=0).astype(np.float32)
         labels = np.array(labels)
-        return Tensor(batch), Tensor(labels)
+        if self.return_tensor:
+            return Tensor(batch), Tensor(labels)
+        else:
+            return batch, labels
 
     def get_test_batch(self):
         """Sample a testing batch (data and label)."""
@@ -592,7 +596,10 @@ class CUB200Iter(DataIter):
         
         batch = np.concatenate(batch, axis=0).astype(np.float32)
         labels = np.array(labels)
-        return Tensor(batch), Tensor(labels)
+        if self.return_tensor:
+            return Tensor(batch), Tensor(labels)
+        else:
+            return batch, labels
 
     def reset(self):
         """Reset an iterator."""

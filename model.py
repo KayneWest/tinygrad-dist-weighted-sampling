@@ -1,143 +1,41 @@
-
-
 import numpy as np
 from tinygrad import nn
 from tinygrad.tensor import Tensor
 from tinygrad.nn import optim
 from tinygrad.helpers import getenv
 from tinygrad.state import get_parameters
-
-def l2_norm(x):
-  if len(x.shape):
-    x = x.reshape((x.shape[0],-1))
-  out = x / Tensor.sqrt(Tensor.sum(x ** 2) + 1e-5)
-  return out
-
-def get_distance(x):
-  sim = Tensor.dot(x, x.T)
-  dist = 2 - 2 * sim
-  dist = dist + Tensor.eye(dist.shape[0])
-  dist = dist.sqrt()
-  return dist
-
-def clamp(x, max_value=None, min_value=None):
-  if not min_value:
-    min_value = x.min()
-  else:
-    if not isinstance(min_value, Tensor):
-      min_value = Tensor(min_value)
-  if not max_value:
-    max_value = x.max()
-    if not isinstance(max_value, Tensor):
-      max_value = Tensor(max_value)
-  return Tensor.min(Tensor.max(x, min_value), max_value) 
-
-class ResNetFeats:
-  def __init__(self, net, batch_size=1, kernel_size=(7,7)) -> None:
-    self.net = net
-    # del the fc layer
-    del self.net.fc
-    self.batch_size = batch_size
-  def __call__(self, x):
-    out = self.net.bn1(self.net.conv1(x)).relu()
-    out = out.pad2d([1,1,1,1]).max_pool2d((3,3), 2)
-    out = out.sequential(self.net.layer1)
-    out = out.sequential(self.net.layer2)
-    out = out.sequential(self.net.layer3)
-    out = out.sequential(self.net.layer4)
-    # add equiv of AdaptiveAvgPool
-    out = out.avg_pool2d(kernel_size=(7,7))
-    return out.reshape(self.batch_size,-1)
+from resnet import ResNet50
 
 class MarginNet:
-  r"""Embedding network with distance weighted sampling.
-  It takes a base CNN and adds an embedding layer and a
-  sampling layer at the end.
-
-  Parameters
-  ----------
-  base_net : Block
-    Base network.
-  emb_dim : int
-    Dimensionality of the embedding.
-  batch_k : int
-    Number of images per class in a batch. Used in sampling.
-
-  Inputs:
-    - **data**: input tensor with shape (batch_size, channels, width, height).
-    Here we assume the consecutive batch_k images are of the same class.
-    For example, if batch_k = 5, the first 5 images belong to the same class,
-    6th-10th images belong to another class, etc.
-
-  Outputs:
-    - The normalized embedding.
-  """
-  
-  def __init__(self, base_net, base_net_out, emb_dim, batch_k, feat_dim=None, normalize=False):
+  def __init__(self, emb_dim, batch_size):
     super(MarginNet, self).__init__()
-    self.base_net = base_net
-    self.dense = Tensor.kaiming_uniform(base_net_out, emb_dim)
-    self.normalize = l2_norm
+    self.feature_net = ResNet50()
+    self.dense = Tensor.kaiming_uniform(2048, emb_dim)
+    self.batch_size = batch_size
 
-  def encode(self, x):
-    """
-    model used in forward function without training or sampling,
-    this method is used in the beer-service
+  def feature_detector(self, x):
+    out = self.feature_net.bn1(self.feature_net.conv1(x)).relu()
+    out = out.pad2d([1,1,1,1]).max_pool2d((3,3), 2)
+    out = out.sequential(self.feature_net.layer1)
+    out = out.sequential(self.feature_net.layer2)
+    out = out.sequential(self.feature_net.layer3)
+    out = out.sequential(self.feature_net.layer4)
+    out = out.avg_pool2d(kernel_size=(7,7)) # equiv of AdaptiveAvgPool
+    return out.reshape(self.batch_size, -1) # -1?
 
-    Args:
-    -----
-    x : mx.nd.array
-      the data you want to embed
-    Returns:
-    --------
-    z: mx.nd.array
-      the embedded data
-    """
-    z = self.base_net(x)
-    z = Tensor.linear(z, self.dense)
-    z = self.normalize(z)
-    return z
-
-  def save(self, filename):
-    with open(filename+'.npy', 'wb') as f:
-      for par in get_parameters(self):
-        np.save(f, par.cpu().numpy())
-
-  def load(self, filename):
-    with open(filename+'.npy', 'rb') as f:
-      for par in get_parameters(self):
-        try:
-          par.cpu().numpy()[:] = np.load(f)
-          if GPU:
-            par.gpu()
-        except:
-          print('Could not load parameter')
+  def load_basenet_features(self): 
+    self.feature_net.load_from_pretrained()
+    del self.feature_net.fc # del last layer
 
   def __call__(self, x):
-    return self.encode(x)
+    z = self.feature_detector(x)
+    z = Tensor.linear(z, self.dense)
+    if z.shape: z = z.reshape((z.shape[0],-1))
+    normalized_emb = z / Tensor.sqrt(Tensor.sum(z ** 2) + 1e-5)
+    return normalized_emb
 
-# pylint: disable=R0903
 class DistanceWeightedMarginLoss:
-  r"""Margin based loss.
-
-  Parameters
-  ----------
-  margin : float
-    Margin between positive and negative pairs.
-  nu : float
-    Regularization parameter for beta.
-
-  Inputs:
-    - anchors: sampled anchor embeddings.
-    - positives: sampled positive embeddings.
-    - negatives: sampled negative embeddings.
-    - beta_in: class-specific betas.
-    - a_indices: indices of anchors. Used to get class-specific beta.
-
-  Outputs:
-    - Loss.
-  """
-  def __init__(self, batch_size, batch_k, margin=0.2, nu=0.0, weight=None, batch_axis=0, cutoff=0.5, nonzero_loss_cutoff=1.4, normalize =False, **kwargs):
+  def __init__(self, batch_size, batch_k, embed_dim, margin=0.2, nu=0.0, weight=None, batch_axis=0, cutoff=0.5, nonzero_loss_cutoff=1.4, normalize =False, **kwargs):
     super(DistanceWeightedMarginLoss, self).__init__()
     self._margin = margin
     self._nu = nu
@@ -145,42 +43,60 @@ class DistanceWeightedMarginLoss:
     self.cutoff = cutoff
     self.nonzero_loss_cutoff = nonzero_loss_cutoff
     self.normalize = normalize
+    self.batch_size = batch_size
+    self.embed_dim = embed_dim
 
+    # fill mask matrix and 
     mask = np.ones((batch_size, batch_size)).astype(np.float32)
-    for i in range(0,batch_size, batch_k):
-      mask[i:i+batch_k, i:i+batch_k] = float(0)
+    for i in range(0,batch_size, batch_k): mask[i:i + batch_k, i:i + batch_k] = 0.
+    self.mask_uniform_probs = mask * (1.0 / (batch_size - batch_k))
+    self.mask = Tensor(mask.astype(np.float32), requires_grad=False)
 
-    self.mask_uniform_probs = mask *(1.0/(batch_size-batch_k))
-    self.mask = Tensor(mask)
-
-  # can be done w/out numpy
   def get_distance(self, x):
-    k = self.batch_k
     n, d = x.shape
-    distance = get_distance(x)
-    distance = Tensor.maximum(distance, self.cutoff)
+    square = Tensor.sum(x ** 2, axis=1, keepdim=True)
+    distance_square = square + square.transpose() - (2.0 * Tensor.dot(x, x.transpose()))
+    distance_mat = Tensor.sqrt(distance_square + Tensor.eye(x.shape[0]))
+    distance = Tensor.maximum(distance_mat, self.cutoff)
 
     # Subtract max(log(distance)) for stability.
     log_weights = ((2.0 - float(d)) * Tensor.log(distance)
              - (float(d - 3) / 2) * Tensor.log(1.0 - 0.25 * (distance ** 2.0)))
     weights = Tensor.exp(log_weights - Tensor.max(log_weights))
 
-    if x.device != weights.device:
-      weights = weights.to(x.device)
+    weights = weights * self.mask * (distance < self.nonzero_loss_cutoff) #Tensor.where(distance < self.non_zero_cuttoff, 0.0)
+    weights_sum = Tensor.sum(weights, axis=1, keepdim=True)
+    weights = weights / weights_sum
+    return weights_sum, weights, n 
 
-    weights = weights*self.mask*((distance < self.nonzero_loss_cutoff)) + 1e-8
+  def get_distance_short(self, x):
+    n, d = x.shape
+    # get distance matrix
+    square = Tensor.sum(x ** 2, axis=1, keepdim=True)
+    distance_mat = Tensor.sqrt(square + square.transpose() - (2.0 * Tensor.dot(x, x.transpose())) + Tensor.eye(x.shape[0]))
+    distance = Tensor.maximum(distance_mat, self.cutoff)
 
+    # Subtract max(log(distance)) for stability.
+    log_weights = ((2.0 - float(d)) * Tensor.log(distance) - (float(d - 3) / 2) * Tensor.log(1.0 - 0.25 * (distance ** 2.0)))
+    weights = Tensor.exp(log_weights - Tensor.max(log_weights))
+
+    weights = weights * self.mask * (distance < self.nonzero_loss_cutoff) #Tensor.where(distance < self.non_zero_cuttoff, 0.0)
     weights_sum = Tensor.sum(weights, axis=1, keepdim=True)
     weights = weights / weights_sum
     return weights_sum, weights, n
 
+
   # needs numpy
   def random_sample(self, weights_sum, weights, n):
+    #- anchors: sampled anchor embeddings.
+    #- positives: sampled positive embeddings.
+    #- negatives: sampled negative embeddings.
+    #- beta_in: class-specific betas.
+    #- a_indices: indices of anchors. Used to get class-specific beta.
     a_indices = []
     p_indices = []
     n_indices = []
 
-    # this might throw it thought a loop
     np_weights = weights.realize().numpy()
     np_weights_sum = weights_sum.realize().numpy()
     for i in range(n):
@@ -188,11 +104,10 @@ class DistanceWeightedMarginLoss:
 
       if np_weights_sum[i] != 0:
         try:
-          n_indices +=  np.random.choice(n, self.batch_k-1, p=np_weights[i]).tolist()
+          n_indices += np.random.choice(n, self.batch_k-1, p=np_weights[i]).tolist()
         except ValueError: #ValueError: probabilities do not sum to 1 
-          to_add = 1-np_weights[i].sum()
           idx = np.argmin(np_weights[i])
-          np_weights[i][idx]+=to_add
+          np_weights[i][idx] += 1 - np_weights[i].sum()
           n_indices +=  np.random.choice(n, self.batch_k-1, p=np_weights[i]).tolist()
       else:
         n_indices +=  np.random.choice(n, self.batch_k-1, p=self.mask_uniform_probs[i]).tolist()
@@ -203,19 +118,54 @@ class DistanceWeightedMarginLoss:
 
     return a_indices, p_indices, n_indices
 
+  # needs numpy
+  def random_sample(self, weights_sum, weights, n):
+    #- anchors: sampled anchor embeddings.
+    #- positives: sampled positive embeddings.
+    #- negatives: sampled negative embeddings.
+    #- beta_in: class-specific betas.
+    #- a_indices: indices of anchors. Used to get class-specific beta.
+    a_indices = []
+    p_indices = []
+    n_indices = []
+
+    np_weights = weights.realize().numpy()
+    np_weights_sum = weights_sum.realize().numpy()
+    for i in range(n):
+      block_idx = i // self.batch_k
+
+      if np_weights_sum[i] != 0:
+        try:
+          n_indices += np.random.choice(n, self.batch_k-1, p=np_weights[i]).tolist()
+        except ValueError: #ValueError: probabilities do not sum to 1 
+          idx = np.argmin(np_weights[i])
+          np_weights[i][idx] += 1 - np_weights[i].sum()
+          n_indices +=  np.random.choice(n, self.batch_k-1, p=np_weights[i]).tolist()
+      else:
+        n_indices +=  np.random.choice(n, self.batch_k-1, p=self.mask_uniform_probs[i]).tolist()
+      for j in range(block_idx * self.batch_k, (block_idx + 1)*self.batch_k):
+        if j != i:
+          a_indices.append(i)
+          p_indices.append(j)
+
+    return a_indices, p_indices, n_indices
+
+
   def get_loss(self, x, y, beta_in, a_indices, p_indices, n_indices):
-    # this so weird and can be done a bit better
+
     total_loss = Tensor(0.0)
     pair_cnt = Tensor(0)
     beta_reg_loss = Tensor(0)
+    y_r = y.realize().numpy()
     for i in range(len(a_indices)):
-      i_beta = beta_in[i]
+      i_beta = beta_in[y_r[a_indices[i]]] # this is inc
       i_anchors = x[a_indices[i]]
       i_positives = x[p_indices[i]]
-      i_negatives = x[n_indices[i]]
-      d_ap = Tensor.sqrt(Tensor.sum(Tensor.square(i_positives - i_anchors), axis=0) + 1e-8)
-      d_an = Tensor.sqrt(Tensor.sum(Tensor.square(i_negatives - i_anchors), axis=0) + 1e-8)
+      i_negatives = x[n_indices[i]] 
+      d_ap = Tensor.sqrt(Tensor.sum(Tensor.square(i_positives - i_anchors)) + 1e-8)
+      d_an = Tensor.sqrt(Tensor.sum(Tensor.square(i_negatives - i_anchors)) + 1e-8)
 
+      # max is 0.0 
       pos_loss = Tensor.maximum(d_ap - i_beta + self._margin, Tensor(0.0))
       neg_loss = Tensor.maximum(i_beta - d_an + self._margin, Tensor(0.0))
 
@@ -242,147 +192,75 @@ class DistanceWeightedMarginLoss:
     loss, pair_cnt = self.get_loss(x, y, beta_in, a_indices, p_indices, n_indices)
     return loss, pair_cnt
 
-# pylint: disable=R0903
-class MarginLoss:
-  r"""Margin based loss.
 
-  Parameters
-  ----------
-  margin : float
-    Margin between positive and negative pairs.
-  nu : float
-    Regularization parameter for beta.
-
-  Inputs:
-    - anchors: sampled anchor embeddings.
-    - positives: sampled positive embeddings.
-    - negatives: sampled negative embeddings.
-    - beta_in: class-specific betas.
-    - a_indices: indices of anchors. Used to get class-specific beta.
-
-  Outputs:
-    - Loss.
-  """
-  def __init__(self, margin=0.2, nu=0.0, weight=None, batch_axis=0, **kwargs):
-    super(MarginLoss, self).__init__()
-    self._margin = margin
-    self._nu = nu
-
-  # pylint: disable=C0111,R0914,W0221,R0913
-  def foward(self, anchors, positives, negatives, beta_in, a_indices=None):
-    """
-    deriving the loss for the model's outputs
-
-    Args:
-    -----
-    anchors: mx.nd.array
-    positives: mx.nd.array
-    negatives: mx.nd.array
-    beta_in: float
-    a_indices: bool
-
-    Returns:
-    --------
-    """
-    if a_indices is not None:
-      # Jointly train class-specific beta.
-      beta = Tensor(beta_in.numpy()[a_indices])
-      beta_reg_loss = Tensor.sum(beta) * self._nu
-    else:
-      # Use a constant beta.
-      beta = beta_in
-      beta_reg_loss = 0.0
-    
-    if isinstance(beta, np.ndarray):
-      beta = Tensor(beta)
-
-    d_ap = Tensor.sqrt(Tensor.sum(Tensor.square(positives - anchors), axis=1) + 1e-8)
-    d_an = Tensor.sqrt(Tensor.sum(Tensor.square(negatives - anchors), axis=1) + 1e-8)
-
-    pos_loss = Tensor.maximum(d_ap - beta + self._margin, Tensor(0.0))
-    neg_loss = Tensor.maximum(beta - d_an + self._margin, Tensor(0.0))
-
-    pair_cnt = Tensor.sum((pos_loss > 0.0) + (neg_loss > 0.0))
-    if pair_cnt == 0.0:
-      # When poss_loss and neg_loss is zero then total loss is zero as well
-      loss = Tensor.sum(pos_loss + neg_loss)
-    else:
-      # Normalize based on the number of pairs.
-      loss = (Tensor.sum(pos_loss + neg_loss) + beta_reg_loss) / pair_cnt
-    # pylint: disable=W0212
-    return loss, pair_cnt
-
-class DistanceWeightedSampling:
-  '''
-  parameters
-  ----------
-  batch_k: int
-    number of images per class
-
-  Inputs:
-    data: input tensor with shapeee (batch_size, edbed_dim)
-      Here we assume the consecutive batch_k examples are of the same class.
-      For example, if batch_k = 5, the first 5 examples belong to the same class,
-      6th-10th examples belong to another class, etc.
-  Outputs:
-    a_indices: indicess of anchors
-    x[a_indices]
-    x[p_indices]
-    x[n_indices]
-    xxx
-  '''
-
-  def __init__(self, batch_k, cutoff=0.5, nonzero_loss_cutoff=1.4, normalize =False,  **kwargs):
-    super(DistanceWeightedSampling,self).__init__()
-    self.batch_k = batch_k
-    self.cutoff = cutoff
-    self.nonzero_loss_cutoff = nonzero_loss_cutoff
-    self.normalize = normalize
-
-  def forward(self, x):
-    k = self.batch_k
+  def get(self, x, y, beta_in):
     n, d = x.shape
-    eye_tensor = Tensor.eye(n)
-    # distance = get_distance(x, is_train=True, eye_tensor=eye_tensor)
-    distance = get_distance(x)
-    distance = Tensor.maximum(distance, self.cutoff)
+    # get distance matrix
+    square = Tensor.sum(x ** 2, axis=1, keepdim=True)
+    distance = (square + square.transpose() - (2.0 * Tensor.dot(x, x.transpose())) + Tensor.eye(x.shape[0])).sqrt().maximum(self.cutoff)
 
     # Subtract max(log(distance)) for stability.
-    log_weights = ((2.0 - float(d)) * Tensor.log(distance)
-             - (float(d - 3) / 2) * Tensor.log(1.0 - 0.25 * (distance ** 2.0)))
-    weights = Tensor.exp(log_weights - Tensor.max(log_weights))
+    log_weights = ((2.0 - float(d)) * distance.log() - (float(d - 3) / 2) * (1.0 - 0.25 * (distance ** 2.0)).log())
+    weights = (log_weights - log_weights.max()).exp()
 
-    if x.device != weights.device:
-      weights = weights.to(x.device)
-
-    mask = np.ones(weights.shape)
-    for i in range(0,n,k):
-      mask[i:i+k, i:i+k] = 0
-
-    mask_uniform_probs = mask *(1.0/(n-k))
-    mask = Tensor(mask)
-
-    weights = weights*mask*((distance < self.nonzero_loss_cutoff)) + 1e-8
-    weights_sum = Tensor.sum(weights, axis=1, keepdim=True)
+    weights = weights * self.mask * (distance < self.nonzero_loss_cutoff)
+    weights_sum = weights.sum(axis=1, keepdim=True) # we need this var...
     weights = weights / weights_sum
 
+    np_weights = weights.realize().numpy()
+    np_weights_sum = weights_sum.realize().numpy()
     a_indices = []
     p_indices = []
     n_indices = []
 
-    np_weights = weights.cpu().numpy()
+    np_weights = weights.realize().numpy()
+    np_weights_sum = weights_sum.realize().numpy()
     for i in range(n):
-      block_idx = i // k
+      block_idx = i // self.batch_k
 
-      if weights_sum[i] != 0:
-        n_indices +=  np.random.choice(n, k-1, p=np_weights[i]).tolist()
+      if np_weights_sum[i] != 0:
+        try:
+          n_indices += np.random.choice(n, self.batch_k-1, p=np_weights[i]).tolist()
+        except ValueError: #ValueError: probabilities do not sum to 1 
+          idx = np.argmin(np_weights[i])
+          np_weights[i][idx] += 1 - np_weights[i].sum()
+          n_indices +=  np.random.choice(n, self.batch_k-1, p=np_weights[i]).tolist()
       else:
-        n_indices +=  np.random.choice(n, k-1, p=mask_uniform_probs[i]).tolist()
-      for j in range(block_idx * k, (block_idx + 1)*k):
+        n_indices +=  np.random.choice(n, self.batch_k-1, p=self.mask_uniform_probs[i]).tolist()
+      for j in range(block_idx * self.batch_k, (block_idx + 1)*self.batch_k):
         if j != i:
           a_indices.append(i)
           p_indices.append(j)
-    
-    realized = x.numpy()
-    return  a_indices, Tensor(realized[a_indices]), Tensor(realized[p_indices]), Tensor(realized[n_indices]), x
+
+
+      # batch_k = 5 -1 
+      #a_indices = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9, 9]
+      #p_indices = [1, 2, 3, 4, 0, 2, 3, 4, 0, 1, 3, 4, 0, 1, 2, 4, 0, 1, 2, 3, 6, 7, 8, 9, 5, 7, 8, 9, 5, 6, 8, 9, 5, 6, 7, 9, 5, 6, 7, 8]
+      #n_indices = [5, 5, 7, 9, 6, 8, 7, 6, 5, 7, 5, 8, 7, 6, 6, 8, 6, 6, 7, 8, 2, 3, 0, 2, 2, 4, 3, 0, 1, 0, 3, 1, 0, 0, 4, 3, 4, 0, 1, 1]
+
+      # a-indices are the index of the given thing so a_copied 
+      
+
+    #i_anchors = Tensor.cat(*[x[i] for q in range(self.batch_k - 1)]).reshape(self.batch_k - 1, self.embed_dim)
+      
+    y_r = y.realize().numpy()
+    anchors = Tensor.cat(*[x[a] for a in a_indices]).reshape(self.batch_size * (self.batch_k - 1), self.embed_dim)
+    positives = Tensor.cat(*[x[p] for p in p_indices]).reshape(self.batch_size * (self.batch_k - 1), self.embed_dim)
+    negatives = Tensor.cat(*[x[n] for n in n_indices]).reshape(self.batch_size * (self.batch_k - 1), self.embed_dim)
+    betas = Tensor.cat(*[beta_in[y_r[a]] for a in a_indices]).reshape(self.batch_size * (self.batch_k - 1), 1)
+
+    beta_reg_loss = betas.sum() * self._nu
+
+    d_ap = ((positives - anchors).square().sum(axis=1) + 1e-8).sqrt()
+    d_an = ((negatives - anchors).square().sum(axis=1) + 1e-8).sqrt()
+
+    # max is 0.0
+    pos_loss = (d_ap - betas + self._margin).maximum(0.)
+    neg_loss = (betas - d_an + self._margin).maximum(0.)
+
+    # RuntimeError: backward not implemented for <class 'tinygrad.mlops.Equal'>
+    pair_cnt = float(Tensor.sum((pos_loss > 0.0) + (neg_loss > 0.0)).numpy())
+
+    loss = ((pos_loss + neg_loss).sum() + beta_reg_loss) / pair_cnt
+    return loss
 
