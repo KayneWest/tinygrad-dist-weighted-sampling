@@ -11,14 +11,11 @@ from data import cub200_iterator
 
 from tinygrad.tensor import Tensor
 from tinygrad.nn import optim
-from model import MarginNet, DistanceWeightedMarginLoss, MarginLoss
-from resnet import ResNet50
+from model import MarginNet, MarginLoss
 from tinygrad.state import get_parameters
 from tinygrad.jit import TinyJit
 
 from evaluation import evaluate_emb_faiss, test_faiss
-
-# logging.basicConfig(level=logging.INFO)
 
 # CLI
 parser = argparse.ArgumentParser(description='train a model for image classification.')
@@ -36,9 +33,9 @@ parser.add_argument('--epochs', type=int, default=20,
                     help='number of training epochs. default is 20.')
 parser.add_argument('--optimizer', type=str, default='adam',
                     help='optimizer. default is adam.')
-parser.add_argument('--lr', type=float, default=0.001,
+parser.add_argument('--lr', type=float, default=0.0001,
                     help='learning rate. default is 0.0001.')
-parser.add_argument('--lr-beta', type=float, default=0.2,
+parser.add_argument('--lr-beta', type=float, default=0.1,
                     help='learning rate for the beta in margin based loss. default is 0.1.')
 parser.add_argument('--margin', type=float, default=0.2,
                     help='margin for the margin based loss. default is 0.2.')
@@ -70,48 +67,16 @@ opt = parser.parse_args()
 
 # logging.info(opt)
 
-
 class OptimizerGroup(list):
   def zero_grad(self): (optimizer.zero_grad() for optimizer in self)
   def step(self): (optimizer.step() for optimizer in self)
        
-
-
 def get_lr(lr, epoch, steps, factor):
   """Get learning rate based on schedule."""
   for s in steps:
     if epoch >= s:
       lr *= factor
   return lr
-
-#TODO actually get this to work with the random function
-@TinyJit
-def train_step_jitted(net, margin_loss, beta, X, Y, group_trainer):
-  embeddings = net(X)
-  #embeddings = infrence_jitted(net, data) #Nothing to Jit..?
-  losses = margin_loss.get(embeddings, Y, beta)
-  losses = losses[0] if isinstance(losses, tuple) else losses
-  group_trainer.zero_grad()
-
-  losses.backward()
-
-  group_trainer.step()
-
-  return losses.realize()
-
-@TinyJit
-def inference(net, margin_loss, data):
-    embeddings = net(data)
-    weights_sum, weights, n = margin_loss.get_distance_short(embeddings)
-    return embeddings.realize(), weights_sum.realize(), weights.realize(), n
-
-#@TinyJit
-def loss_function(margin_loss, group_trainer, embeddings, label, beta, a_indices, p_indices, n_indices):
-    losses = margin_loss.get_loss_(embeddings, label, beta, a_indices, p_indices, n_indices)
-    group_trainer.zero_grad()
-    losses.backward()
-    group_trainer.step()
-    return losses.realize()
 
 @TinyJit
 def jit_train(net, margin_loss, beta, X, Y, group_trainer):
@@ -122,46 +87,74 @@ def jit_train(net, margin_loss, beta, X, Y, group_trainer):
   group_trainer.step()
   return losses.realize()
 
-
 @TinyJit
 def infrence_jitted(net, X):
-  # doesn't work when training=True...
   embeddings = net(X)
-  return embeddings.realize()
+  return embeddings.realize().numpy()
+
+def test_faiss(net, val_data, epoch, save_dir='', save_model_prefix='', plot=True):
+  """Test a model."""
+  print('starting test')
+  Tensor.training = False
+  val_data.reset()
+  val_data.reset()
+  outputs = []
+  labels = []
+  count = 0
+  for batch in val_data:
+    data = batch.data[0]
+    label = batch.label[0]
+    if data.__class__ is np.ndarray:
+      data =  Tensor(data, requires_grad=False)
+    outputs.append(infrence_jitted(net, data))
+    
+    labels.append(label)
+    count += 1
+  print('finished iterating through val_data')
+  outputs = np.vstack(outputs)
+  labels = np.hstack(labels)
+  labels = labels.reshape(labels.shape[0], 1)
+  if labels.shape[0] != outputs.shape[0]:
+    if labels.shape[0] > outputs.shape[0]:
+      labels = labels[:outputs.shape[0]]
+    else:
+      outputs = outputs[:labels.shape[0]]
+  val_data.reset()
+  return evaluate_emb_faiss(outputs, labels, val_data,
+                save_dir, save_model_prefix,
+                epoch=epoch, plot=plot)
 
 def range_finder(batch_size): return 14000 // batch_size
 
 def train(net, epochs, use_val=False):
   """Training function."""
-  
   # train resnet separately th
-  
   params_feature_detector = get_parameters(net.feature_detector)
   params_embeddings = get_parameters(net.dense)
   use_optimizer_group = True
   if use_optimizer_group:
     group_trainer = OptimizerGroup()
     # dampen net
-    group_trainer.append(optim.AdamW(params_feature_detector, lr= opt.lr * 0.01, wd=opt.wd, eps=1e-7))
+    group_trainer.append(optim.AdamW(params_feature_detector, lr= opt.lr, wd=opt.wd, eps=1e-7))
     group_trainer.append(optim.AdamW(params_embeddings, lr= opt.lr, wd=opt.wd, eps=1e-7))
     if opt.lr_beta > 0.0:
         group_trainer.append(optim.SGD([beta], lr = opt.lr_beta, momentum = 0.9))
   else:
     group_trainer = []
     # dampen net
-    group_trainer.append(optim.AdamW(params_feature_detector, lr= opt.lr * 0.01, wd=opt.wd, eps=1e-7))
+    group_trainer.append(optim.AdamW(params_feature_detector, lr= opt.lr * 0.001, wd=opt.wd, eps=1e-7))
     group_trainer.append(optim.AdamW(params_embeddings, lr= opt.lr, wd=opt.wd, eps=1e-7))
     if opt.lr_beta > 0.0:
         group_trainer.append(optim.SGD([beta], lr = opt.lr_beta, momentum = 0.9))
 
   margin_loss = MarginLoss(embed_dim=opt.embed_dim, batch_size=opt.batch_size, margin=opt.margin, nu=opt.nu, batch_k=opt.batch_k)
-  Tensor.training = True
   
   best_val = 0.0
 
   hack = False
 
   for epoch in range(epochs):
+    Tensor.training = True
     tic = time.time()
     prev_loss, cumulative_loss = 0.0, 0.0
 
@@ -186,31 +179,6 @@ def train(net, epochs, use_val=False):
       y_r = label.realize().numpy()
 
       losses = jit_train(net, margin_loss, beta, data, y_r, group_trainer)
-
-      '''
-      a_indices, p_indices, n_indices, embeddings = net.sample(data)
-      losses = margin_loss(embeddings, label, beta, a_indices, p_indices, n_indices)
-      if use_optimizer_group:
-        group_trainer.zero_grad()
-        # compute gradient and do SGD steps
-        losses.backward()
-        group_trainer.step()
-      else:
-        for group in group_trainer:
-          group.zero_grad()
-        losses.backward()
-        for group in group_trainer:
-          group.step()
-      # subprocess.call('nvidia-smi')
-      '''
-      '''
-      if not hack:
-        losses = train_step_jitted(net, margin_loss, beta, data, label, group_trainer)
-        train_step_jitted.cnt = 3
-        hack = True
-      else:
-        losses = train_step_jitted(net, margin_loss, beta, data, label, group_trainer)
-      '''
       
       cumulative_loss = cumulative_loss + losses.realize()
       
@@ -225,7 +193,8 @@ def train(net, epochs, use_val=False):
 
     if use_val:
         names, val_accs = test_faiss(net, val_data, epoch,
-                                        opt.save_dir, opt.save_model_prefix)
+                                        opt.save_dir, opt.save_model_prefix
+                                        plot=False)
         for name, val_acc in zip(names, val_accs):
             print(f'[Epoch {epoch}] validation: {name}={val_acc}')
 
@@ -252,7 +221,7 @@ if __name__ == '__main__':
   # Get iterators.
   train_data, val_data = cub200_iterator(opt.data_path, opt.batch_k, batch_size, (3, 224, 224))
 
-  best_val_recall = train(net, opt.epochs)
+  best_val_recall = train(net, opt.epochs, True)
   print('Best validation Recall@1: %.2f.' % best_val_recall)
 
 

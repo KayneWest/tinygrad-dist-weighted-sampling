@@ -219,8 +219,10 @@ def plot_similarity_query(index, val_data, embedding, img, fname,
   plt.savefig("{}/{}-EPOCH-{}-{}.png".format(save_dir, save_model_prefix, epoch, real_label))
 
 # pylint: disable=R0912, R0915, C0325
-def evaluate_emb_faiss(emb, labels, val_data, save_dir,
-             save_model_prefix, epoch=0):
+def evaluate_emb_faiss(
+  emb, labels, val_data, save_dir,
+  save_model_prefix, epoch=0, 
+  plot=True):
   """Evaluate embeddings based on Recall@k.
 
   Args:
@@ -251,13 +253,14 @@ def evaluate_emb_faiss(emb, labels, val_data, save_dir,
   index = faiss.IndexFlatL2(emb.shape[1])
   index.add(emb)
   print('plotting imgs')
-  for _ in range(10):
-    idx = random.choice(list(range(emb.shape[0])))
-    fname = val_data.dict_classes[idx][1]
-    img = cv2.imread(fname)
-    embedding = emb[idx].reshape(1, -1)
-    plot_similarity_query(index, val_data, embedding,
-                img, fname, epoch, save_dir, save_model_prefix)
+  if plot:
+    for _ in range(10):
+      idx = random.choice(list(range(emb.shape[0])))
+      fname = val_data.dict_classes[idx][1]
+      img = cv2.imread(fname)
+      embedding = emb[idx].reshape(1, -1)
+      plot_similarity_query(index, val_data, embedding,
+                  img, fname, epoch, save_dir, save_model_prefix)
 
   names = []
   accs = []

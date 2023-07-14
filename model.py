@@ -4,12 +4,12 @@ from tinygrad.tensor import Tensor
 from tinygrad.nn import optim
 from tinygrad.helpers import getenv
 from tinygrad.state import get_parameters
-from resnet import ResNet50
+from resnet import ResNet50, ResNet101
 
 class MarginNet:
   def __init__(self, emb_dim, batch_size, batch_k, cutoff=0.5, non_zero_cuttoff=1.4, **kwargs):
     super(MarginNet, self).__init__()
-    self.feature_net = ResNet50()
+    self.feature_net = ResNet101()
     self.dense = Tensor.kaiming_uniform(2048, emb_dim)
     self.batch_size = batch_size
     self.sampler = DistanceWeightedSampling(batch_size, batch_k, cutoff, non_zero_cuttoff, **kwargs)
