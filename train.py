@@ -23,7 +23,7 @@ parser.add_argument('--data-path', type=str, default='cub200_data/CUB_200_2011',
                     help='path of data.')
 parser.add_argument('--embed-dim', type=int, default=128,
                     help='dimensionality of image embedding. default is 128.')
-parser.add_argument('--batch-size', type=int, default=20,
+parser.add_argument('--batch-size', type=int, default=10,
                     help='training batch size per device (CPU/GPU). default is 70.')
 parser.add_argument('--batch-k', type=int, default=5,
                     help='number of images per class in a batch. default is 5.')
@@ -79,9 +79,18 @@ def get_lr(lr, epoch, steps, factor):
   return lr
 
 @TinyJit
-def jit_train(net, margin_loss, beta, X, Y, group_trainer):
+def jit_train_old(net, margin_loss, beta, X, Y, group_trainer):
   a_indices, p_indices, n_indices, embeddings = net.sample(X)
   losses = margin_loss(embeddings, Y, beta, a_indices, p_indices, n_indices)
+  group_trainer.zero_grad()
+  losses.backward()
+  group_trainer.step()
+  return losses.realize()
+
+@TinyJit
+def jit_train(net, margin_loss, beta, X, Y, group_trainer):
+  a_indices, anchors, positives, negatives, embeddings = net.sample(X)
+  losses = margin_loss(Y, beta, a_indices, anchors, positives, negatives)
   group_trainer.zero_grad()
   losses.backward()
   group_trainer.step()
@@ -107,7 +116,6 @@ def test_faiss(net, val_data, epoch, save_dir='', save_model_prefix='', plot=Tru
     if data.__class__ is np.ndarray:
       data =  Tensor(data, requires_grad=False)
     outputs.append(infrence_jitted(net, data))
-    
     labels.append(label)
     count += 1
   print('finished iterating through val_data')
@@ -120,29 +128,27 @@ def test_faiss(net, val_data, epoch, save_dir='', save_model_prefix='', plot=Tru
     else:
       outputs = outputs[:labels.shape[0]]
   val_data.reset()
-  return evaluate_emb_faiss(outputs, labels, val_data,
-                save_dir, save_model_prefix,
-                epoch=epoch, plot=plot)
+  return evaluate_emb_faiss(outputs, labels, val_data, save_dir, save_model_prefix, epoch=epoch, plot=plot)
 
 def range_finder(batch_size): return 14000 // batch_size
 
 def train(net, epochs, use_val=False):
   """Training function."""
   # train resnet separately th
-  params_feature_detector = get_parameters(net.feature_detector)
+  params_feature_detector = get_parameters(net.feature_net)
   params_embeddings = get_parameters(net.dense)
   use_optimizer_group = True
   if use_optimizer_group:
     group_trainer = OptimizerGroup()
-    # dampen net
-    group_trainer.append(optim.AdamW(params_feature_detector, lr= opt.lr, wd=opt.wd, eps=1e-7))
+    # dampen net -- todo only convs...
+    group_trainer.append(optim.AdamW(params_feature_detector, lr= opt.lr * 0.01, wd=opt.wd, eps=1e-7))
     group_trainer.append(optim.AdamW(params_embeddings, lr= opt.lr, wd=opt.wd, eps=1e-7))
     if opt.lr_beta > 0.0:
         group_trainer.append(optim.SGD([beta], lr = opt.lr_beta, momentum = 0.9))
   else:
     group_trainer = []
     # dampen net
-    group_trainer.append(optim.AdamW(params_feature_detector, lr= opt.lr * 0.001, wd=opt.wd, eps=1e-7))
+    group_trainer.append(optim.AdamW(params_feature_detector, lr= opt.lr * 0.01, wd=opt.wd, eps=1e-7))
     group_trainer.append(optim.AdamW(params_embeddings, lr= opt.lr, wd=opt.wd, eps=1e-7))
     if opt.lr_beta > 0.0:
         group_trainer.append(optim.SGD([beta], lr = opt.lr_beta, momentum = 0.9))
@@ -180,7 +186,7 @@ def train(net, epochs, use_val=False):
 
       losses = jit_train(net, margin_loss, beta, data, y_r, group_trainer)
       
-      cumulative_loss = cumulative_loss + losses.realize()
+      cumulative_loss = cumulative_loss + losses
       
       if (i+1) % opt.log_interval == 0:
       #if True:
@@ -193,7 +199,7 @@ def train(net, epochs, use_val=False):
 
     if use_val:
         names, val_accs = test_faiss(net, val_data, epoch,
-                                        opt.save_dir, opt.save_model_prefix
+                                        opt.save_dir, opt.save_model_prefix,
                                         plot=False)
         for name, val_acc in zip(names, val_accs):
             print(f'[Epoch {epoch}] validation: {name}={val_acc}')
@@ -223,6 +229,59 @@ if __name__ == '__main__':
 
   best_val_recall = train(net, opt.epochs, True)
   print('Best validation Recall@1: %.2f.' % best_val_recall)
+
+
+
+
+
+
+def tests(net1, net2, train_inter)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

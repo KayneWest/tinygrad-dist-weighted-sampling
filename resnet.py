@@ -11,6 +11,7 @@ def get_child(parent, key):
       obj = getattr(obj, k)
   return obj
 
+
 class BasicBlock:
   expansion = 1
 
@@ -33,6 +34,7 @@ class BasicBlock:
     out = out + x.sequential(self.downsample)
     out = out.relu()
     return out
+
 
 class Bottleneck:
   # NOTE: stride_in_1x1=False, this is the v1.5 variant
@@ -63,7 +65,7 @@ class Bottleneck:
     return out
 
 class ResNet:
-  def __init__(self, num, num_classes=None, groups=1, width_per_group=64, stride_in_1x1=False, kernel_shape=(7,7)):
+  def __init__(self, num, num_classes=None, groups=1, width_per_group=64, stride_in_1x1=False):
     self.num = num
     self.block = {
       18: BasicBlock,
@@ -83,7 +85,6 @@ class ResNet:
 
     self.in_planes = 64
 
-    self.adaptive_kernel_shape = kernel_shape
     self.groups = groups
     self.base_width = width_per_group
     self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, bias=False, padding=3)
@@ -124,17 +125,6 @@ class ResNet:
       return out
     return features
 
-  def features(self, x):
-    out = self.net.bn1(self.net.conv1(x)).relu()
-    out = out.pad2d([1,1,1,1]).max_pool2d((3,3), 2)
-    out = out.sequential(self.net.layer1)
-    out = out.sequential(self.net.layer2)
-    out = out.sequential(self.net.layer3)
-    out = out.sequential(self.net.layer4)
-    # AdaptiveAvgPool/GlobalAvgPool
-    out = out.avg_pool2d(adaptive_kernel_shape=(7,7))
-    return out.reshape(self.batch_size,-1)
-
   def __call__(self, x):
     return self.forward(x)
 
@@ -172,4 +162,3 @@ ResNet50 = lambda num_classes=1000: ResNet(50, num_classes=num_classes)
 ResNet101 = lambda num_classes=1000: ResNet(101, num_classes=num_classes)
 ResNet152 = lambda num_classes=1000: ResNet(152, num_classes=num_classes)
 ResNeXt50_32X4D = lambda num_classes=1000: ResNet(50, num_classes=num_classes, groups=32, width_per_group=4)
-

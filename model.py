@@ -4,15 +4,16 @@ from tinygrad.tensor import Tensor
 from tinygrad.nn import optim
 from tinygrad.helpers import getenv
 from tinygrad.state import get_parameters
-from resnet import ResNet50, ResNet101
+from resnet import ResNet50, ResNet101, ResNeXt50_32X4D
 
 class MarginNet:
   def __init__(self, emb_dim, batch_size, batch_k, cutoff=0.5, non_zero_cuttoff=1.4, **kwargs):
     super(MarginNet, self).__init__()
-    self.feature_net = ResNet101()
-    self.dense = Tensor.kaiming_uniform(2048, emb_dim)
+    self.feature_net = ResNet50()
+    #self.dense = Tensor.kaiming_uniform(2048, emb_dim)
+    self.dense = Tensor.glorot_uniform(2048, emb_dim, magnitude=2)
     self.batch_size = batch_size
-    self.sampler = DistanceWeightedSampling(batch_size, batch_k, cutoff, non_zero_cuttoff, **kwargs)
+    self.sampler = DistanceWeightedSampling(batch_size, batch_k, emb_dim, cutoff, non_zero_cuttoff, **kwargs)
 
   def feature_detector(self, x):
     out = self.feature_net.bn1(self.feature_net.conv1(x)).relu()
@@ -35,7 +36,7 @@ class MarginNet:
     normalized_emb = z / Tensor.sqrt(Tensor.sum(z ** 2) + 1e-5)
     return normalized_emb
 
-  def sample(self, x):
+  def sample_old(self, x):
     z = self.feature_detector(x)
     z = Tensor.linear(z, self.dense)
     if z.shape: z = z.reshape((z.shape[0],-1))
@@ -43,12 +44,22 @@ class MarginNet:
     a_indices, p_indices, n_indices = self.sampler(normalized_emb)
     return a_indices, p_indices, n_indices, normalized_emb
 
+  def sample(self, x):
+    z = self.feature_detector(x)
+    z = Tensor.linear(z, self.dense)
+    if z.shape: z = z.reshape((z.shape[0],-1))
+    normalized_emb = z / Tensor.sqrt(Tensor.sum(z ** 2) + 1e-5)
+    a_indices, anchors, positives, negatives, _ = self.sampler(normalized_emb)
+    return a_indices, anchors, positives, negatives, normalized_emb
+
 class DistanceWeightedSampling:
-  def __init__(self, batch_size, batch_k, cutoff=0.5, nonzero_loss_cutoff=1.4, **kwargs):
+  def __init__(self, batch_size, batch_k, embed_dim, cutoff=0.5, nonzero_loss_cutoff=1.4, **kwargs):
     super(DistanceWeightedSampling, self).__init__()
     self.batch_k = batch_k
     self.cutoff = cutoff
     self.nonzero_loss_cutoff = nonzero_loss_cutoff
+    self.embed_dim = embed_dim
+    self.batch_size = batch_size
   
     # fill mask matrix and 
     mask = np.ones((batch_size, batch_size)).astype(np.float32)
@@ -67,10 +78,10 @@ class DistanceWeightedSampling:
     weights = weights * self.mask * (distance < self.nonzero_loss_cutoff)
     weights_sum = Tensor.sum(weights, axis=1, keepdim=True)
     weights = weights / weights_sum
-    return weights, weights_sum
+    return weights
 
   # needs numpy
-  def get_samples(self, weights, weights_sum):
+  def get_samples_old(self, weights, weights_sum):
     a_indices = []
     p_indices = []
     n_indices = []
@@ -84,9 +95,9 @@ class DistanceWeightedSampling:
         try:
           n_indices += np.random.choice(np_weights.shape[0], self.batch_k-1, p=np_weights[i]).tolist()
         except ValueError: #ValueError: probabilities do not sum to 1 
-          idx = np.argmin(np_weights[i])
-          np_weights[i][idx] += 1 - np_weights[i].sum()
-          n_indices +=  np.random.choice(np_weights.shape[0], self.batch_k-1, p=np_weights[i]).tolist()
+          # idx = np.argmin(np_weights[i])
+          # np_weights[i][idx] += 1 - np_weights[i].sum()
+          n_indices +=  np.random.choice(np_weights.shape[0], self.batch_k-1).tolist()
       else:
         n_indices +=  np.random.choice(np_weights.shape[0], self.batch_k-1, p=self.mask_uniform_probs[i]).tolist()
       for j in range(block_idx * self.batch_k, (block_idx + 1)*self.batch_k):
@@ -95,11 +106,79 @@ class DistanceWeightedSampling:
           p_indices.append(j)
     return a_indices, p_indices, n_indices
 
-  def __call__(self, x):
-    weights, weights_sum = self.get_weights(x)
-    a_indices, p_indices, n_indices = self.get_samples(weights, weights_sum)
+  # needs numpy
+  def get_samples(self, weights):
+    a_indices = []
+    p_indices = []
+    n_indices = []
+    np_weights = weights.realize().numpy()
+
+    # np_weights = weights.numpy()
+    n = np_weights.shape[0]
+    for i in range(n):
+        block_idx = i // self.batch_k
+        try:
+            n_indices += np.random.choice(n, self.batch_k-1, p=np_weights[i]).tolist()
+        except:
+            n_indices += np.random.choice(n, self.batch_k-1).tolist()
+        for j in range(block_idx * self.batch_k, (block_idx + 1) * self.batch_k):
+            if j != i:
+                a_indices.append(i)
+                p_indices.append(j)
+
     return a_indices, p_indices, n_indices
 
+  def call_old(self, x):
+    weights = self.get_weights(x)
+    a_indices, p_indices, n_indices = self.get_samples(weights)
+    return a_indices, p_indices, n_indices
+
+  def forward(self, x):
+    n, d = x.shape
+    square = (x**2).sum(axis=1, keepdim=True)
+    distance = (square + square.transpose() - (2.0 * x.dot(x.transpose())) + Tensor.eye(x.shape[0])).sqrt().maximum(self.cutoff)
+    # Subtract max(log(distance)) for stability.
+    log_weights = ((2.0 - float(x.shape[1])) * distance.log() - (float(x.shape[1] - 3) / 2) * (1.0 - 0.25 * (distance ** 2.0)).log())
+    weights = (log_weights - log_weights.max()).exp()
+    
+    
+    # get weights
+    #weights = weights * self.mask * (distance < self.nonzero_loss_cutoff)
+    #weights_sum = Tensor.sum(weights, axis=1, keepdim=True)
+    #weights = weights / weights_sum
+
+    mask = np.ones(weights.shape)
+    for i in range(0, n, self.batch_k): mask[i:i+self.batch_k, i:i+self.batch_k] = 0
+
+    weights = weights * Tensor(mask.astype(np.float32)) * (distance < self.nonzero_loss_cutoff)
+    weights_sum = Tensor.sum(weights, axis=1, keepdim=True)
+    weights = weights / weights_sum
+
+    a_indices = []
+    p_indices = []
+    n_indices = []
+    np_weights = weights.realize().numpy()
+
+    # np_weights = weights.numpy()
+    n = np_weights.shape[0]
+    for i in range(n):
+        block_idx = i // self.batch_k
+        try:
+            n_indices += np.random.choice(n, self.batch_k-1, p=np_weights[i]).tolist()
+        except:
+            n_indices += np.random.choice(n, self.batch_k-1).tolist()
+        for j in range(block_idx * self.batch_k, (block_idx + 1) * self.batch_k):
+            if j != i:
+                a_indices.append(i)
+                p_indices.append(j)
+
+    anchors = Tensor.cat(*[x[a] for a in a_indices]).reshape(self.batch_size * (self.batch_k - 1), self.embed_dim)
+    positives = Tensor.cat(*[x[p] for p in p_indices]).reshape(self.batch_size * (self.batch_k - 1), self.embed_dim)
+    negatives = Tensor.cat(*[x[n] for n in n_indices]).reshape(self.batch_size * (self.batch_k - 1), self.embed_dim)
+    return a_indices, anchors, positives, negatives, x
+
+  def __call__(self, x):
+    return self.forward(x)
 
 class MarginLoss:
   r"""Margin based loss.
@@ -192,7 +271,8 @@ class MarginLoss:
     negatives = Tensor.cat(*[x[n] for n in n_indices]).reshape(self.batch_size * (self.batch_k - 1), self.embed_dim)
     betas = Tensor.cat(*[beta[y_r[a]] for a in a_indices]).reshape(self.batch_size * (self.batch_k - 1), 1)
 
-    beta_reg_loss = betas.sum() * self._nu
+    ###### this all works here.... #####
+    beta_reg_loss = betas.sum() * self._nu    
 
     d_ap = ((positives - anchors).square().sum(axis=1) + 1e-8).sqrt()
     d_an = ((negatives - anchors).square().sum(axis=1) + 1e-8).sqrt()
@@ -207,8 +287,33 @@ class MarginLoss:
     loss = ((pos_loss + neg_loss).sum() + beta_reg_loss) / pair_cnt
     return loss
 
-  def __call__(self, x, y, beta_in, a_indices, p_indices, n_indices):
+  def call_old(self, x, y, beta_in, a_indices, p_indices, n_indices):
     return self.get_losses_(x, y, beta_in, a_indices, p_indices, n_indices)
+
+
+  # loss function w y already realized
+  def get_losses_new(self, y_r, beta, a_indices, anchors, positives, negatives):
+    betas = Tensor.cat(*[beta[y_r[a]] for a in a_indices]).reshape(self.batch_size * (self.batch_k - 1), 1)
+
+    ###### this all works here.... #####
+    beta_reg_loss = betas.sum() * self._nu    
+
+    d_ap = ((positives - anchors).square().sum(axis=1) + 1e-8).sqrt()
+    d_an = ((negatives - anchors).square().sum(axis=1) + 1e-8).sqrt()
+
+    # max is 0.0
+    pos_loss = (d_ap - betas + self._margin).maximum(0.)
+    neg_loss = (betas - d_an + self._margin).maximum(0.)
+
+    # RuntimeError: backward not implemented for <class 'tinygrad.mlops.Equal'>
+    pair_cnt = float(Tensor.sum((pos_loss > 0.0) + (neg_loss > 0.0)).numpy())
+
+    loss = ((pos_loss + neg_loss).sum() + beta_reg_loss) / pair_cnt
+    return loss
+
+  def __call__(self, y, beta_in, a_indices, anchors, positives, negatives):
+    return self.get_losses_new(y, beta_in, a_indices, anchors, positives, negatives)
+
 
 class DistanceWeightedMarginLoss:
   def __init__(self, batch_size, batch_k, embed_dim, margin=0.2, nu=0.0, weight=None, batch_axis=0, cutoff=0.5, nonzero_loss_cutoff=1.4, normalize =False, **kwargs):
