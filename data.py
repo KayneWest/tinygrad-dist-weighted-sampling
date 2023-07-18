@@ -618,7 +618,354 @@ class CUB200Iter(DataIter):
                 raise StopIteration
         return DataBatch(data=[data], label=[labels])
 
+
+class CUB200Iter2(DataIter):
+    """Iterator for the CUB200-2011 dataset.
+    Parameters
+    ----------
+    data_path : str,
+        The path to dataset directory.
+    batch_k : int,
+        Number of images per class in a batch.
+    batch_size : int,
+        Batch size.
+    batch_size : tupple,
+        Data shape. E.g. (3, 224, 224).
+    is_train : bool,
+        Training data or testig data. Training batches are randomly sampled.
+        Testing batches are loaded sequentially until reaching the end.
+    """
+    def __init__(self, data_path, batch_k, batch_size, data_shape, is_train, return_tensor=False, max_class=100):
+        super(CUB200Iter2, self).__init__(batch_size)
+        self.data_shape = (batch_size,) + data_shape
+        self.batch_size = batch_size
+        self.provide_data = [('data', self.data_shape)]
+        self.batch_k = batch_k
+        self.is_train = is_train
+        self.return_tensor = return_tensor
+        self.data = {}
+        self.train_image_files = [[] for _ in range(100)]
+        self.test_image_files = []
+        self.test_labels = []
+        self.test_count = 0
+        index = 0
+        self.dict_classes = {}
+
+        with open(os.path.join(data_path, 'images.txt'), 'r') as f_img, \
+             open(os.path.join(data_path, 'image_class_labels.txt'), 'r') as f_label, \
+             open(os.path.join(data_path, 'bounding_boxes.txt'), 'r') as f_box:
+            for line_img, line_label, line_box in zip(f_img, f_label, f_box):
+                fname = os.path.join(data_path, 'images', line_img.strip().split()[-1])
+                label = int(line_label.strip().split()[-1]) - 1
+                box = [int(float(v)) for v in line_box.split()[-4:]]
+                if label not in self.data:
+                    self.data[label] = []
+                self.data[label].append((fname, box))
+        self.n_classes = max(self.data) if min(self.data) == 0 else max(self.data) - 1
+        sorted_labels = sorted(self.data.items(), key=lambda x: len(x[1]), reverse=True)
+        index = 0
+        self.train_data = {}
+        self.test_data = []
+        self.dict_classes = {}
+        self.n_test = 0
+        self.n_test_classes = 0
+        sorted_labels = [x for x in sorted_labels if len(x[1]) > 1]
+
+        for i, (label, items) in enumerate(sorted_labels):
+            if i < max_class:
+                self.train_data[i] = items
+            else:
+                for item in items:
+                    fname = item[0]
+                    bbox = item[1]
+                    self.test_data.append((i, fname, bbox))
+                    self.dict_classes[index] = [i, fname]
+                    index += 1
+                self.n_test += len(items)
+                self.n_test_classes += 1
+        print("n_test: {}".format(self.n_test))
+        print("n_test_classes: {}".format(self.n_test_classes))
+        print("n_train: {}".format(len(self.train_data)))
+
+    def get_image(self, img, bbox, is_train):
+        """Load and transform an image."""
+        img_arr = cv2.imread(img)[...,::-1] 
+        img_arr = transform(img_arr, 256, 256, is_train, bbox)
+        return img_arr
+
+    def sample_train_batch(self):
+        """Sample a training batch (data and label)."""
+        batch = []
+        labels = []
+        num_groups = self.batch_size // self.batch_k
+        # For CUB200, we use the first 100 /2 classes for training.
+        sampled_classes = np.random.choice(list(self.train_data.keys()), num_groups, replace=True)
+        # sampled classes length == num_groups
+        for label in sampled_classes:
+            # pylint: disable=C0326
+            idxs =  np.random.choice(len(self.train_data[label]), self.batch_k, replace=True)
+            for idx in idxs:
+                img_fname, bbox = self.train_data[label][idx]
+                img = self.get_image(img_fname, bbox, is_train=True)
+                batch.append(img)
+                labels.append(label)
+
+        batch = np.concatenate(batch, axis=0).astype(np.float32)
+        labels = np.array(labels)
+        if self.return_tensor:
+            return Tensor(batch), Tensor(labels)
+        else:
+            return batch, labels
+
+    def get_test_batch(self):
+        """Sample a testing batch (data and label)."""
+        batch_size = self.batch_size
+        batch = []
+        labels = []
+        for i in range(batch_size):
+            idx = (self.test_count*batch_size + i) % len(self.test_data)
+            label, img_fname, bbox = self.test_data[idx]
+            img = self.get_image(img_fname, bbox, is_train=False)
+            batch.append(img)
+            labels.append(label)
+
+        batch = np.concatenate(batch, axis=0).astype(np.float32)
+        labels = np.array(labels)
+        if self.return_tensor:
+            return Tensor(batch), Tensor(labels)
+        else:
+            return batch, labels
+
+    def reset(self):
+        """Reset an iterator."""
+        self.test_count = 0
+
+    def next(self):
+        """Return a batch."""
+        if self.is_train:
+            data, labels = self.sample_train_batch()
+        else:
+            if self.test_count * self.batch_size < self.n_test:
+                data, labels = self.get_test_batch()
+                self.test_count += 1
+            else:
+                self.test_count = 0
+                raise StopIteration
+        return DataBatch(data=[data], label=[labels])
+
+# pylint: disable=R0902,R0914,R0913
+class BeerIterFaissPickle(DataIter):
+    """Iterator for the CUB200-2011 dataset.
+    Parameters
+    ----------
+    data_path : str,
+        The path to dataset directory.
+    batch_k : int,
+        Number of images per class in a batch.
+    batch_size : int,
+        Batch size.
+    batch_size : tupple,
+        Data shape. E.g. (3, 224, 224).
+    is_train : bool,
+        Training data or testig data. Training batches are randomly sampled.
+        Testing batches are loaded sequentially until reaching the end.
+    min_n: int
+        the min number of detections needed in the coords file to be
+        considered for this exercise
+    """
+    def __init__(self, data_path, batch_k, batch_size, data_shape,
+                 is_train=False, crop=False, flip=False,
+                 aug_method='change', min_n=5, thresh=0.4, txt=False):
+        super(BeerIterFaissPickle, self).__init__(batch_size)
+        self.data_shape = (batch_size,) + data_shape
+        self.batch_size = batch_size
+        self.provide_data = [('data', self.data_shape)]
+        self.batch_k = batch_k
+        self.is_train = is_train
+        self.shape = data_shape[-1]
+        if aug_method is not None:
+            self.rotator = ImageAugmenter(aug_method)
+        else:
+            self.rotator = None
+
+        self.crop = crop
+        self.flip = flip
+
+        self.boxes = {}
+        self.test_count = 0
+        self.classes = {}
+        self.label_count = {}
+        self.data = {}
+        self.test_data = []
+        self.train_data = {}
+
+
+        # only changes if images are found relevant to our dataset
+        #label = 0
+        label = 0
+        directories = os.listdir(data_path)
+        total_w_max = {}
+        for directory_name in directories:
+            if '.txt' in directory_name:
+                continue
+            directory = os.path.join(data_path, directory_name)
+            path_data = [os.path.join(directory, x) for x in os.listdir(directory)]
+            extensions = sorted(list(set([os.path.splitext(x)[1] for x in path_data])))
+            if extensions in [['.jpeg', '.jpg', '.p', '.txt'], ['.jpeg', '.p', '.txt'], ['.jpg', '.p', '.txt']]:
+                pickle_file = os.path.join(directory, "{}_coords.p".format(directory_name))
+                coords_dict = pickle.load(open(pickle_file, 'rb'))
+                # if len(coords_dict) >= min_n:
+                n_in_class = 0
+                tentative = 0
+                for fname, coords in coords_dict.items():
+                    if len(coords) > 1:
+                        tentative += 1
+                    else:
+                        xmin, ymin, xmax, ymax, conf, _ = coords[0]
+                        if conf >= thresh:
+                            n_in_class += 1
+                if n_in_class < min_n and n_in_class+tentative >= min_n:
+                    # think of strategy here...
+                    pass
+                if n_in_class not in total_w_max:
+                    total_w_max[n_in_class] = 0
+                total_w_max[n_in_class] += 1
+                if n_in_class >= min_n:
+                    for fname, coords in coords_dict.items():
+                        # fname = file_path.png
+                        # coords = [95.0, 49.0, 391.0, 511.0, 0.3459477126598358, 1.0]
+                        # print(coords)
+                        if len(coords) > 1:
+                            continue
+                        fname = os.path.join(directory, fname)
+                        xmin, ymin, xmax, ymax, conf, _ = coords[0]
+                        if conf >= thresh:
+                            box = [int(x) for x in [xmin, ymin, xmax, ymax]]
+                            if label not in self.data:
+                                self.data[label] = []
+
+                            self.data[label].append((fname, box))
+                    label += 1
+        self.n_classes = label
+        print("n_classes: {}".format(self.n_classes))
+        print("total_w_max: {}".format(total_w_max))
+        # Following "Deep Metric Learning via Lifted Structured Feature Embedding" paper,
+        # we use the first 100 classes for training, and the remaining for testing.
+        # NOTE: they use half the 200 classes for training, in the their implementation
+        # so we'll use half for training in our implementation
+        sorted_labels = sorted(self.data.items(), key=lambda x: len(x[1]), reverse=True)
+        index = 0
+        self.dict_classes = {}
+        self.n_test = 0
+        self.n_test_classes = 0
+        sorted_labels = [x for x in sorted_labels if len(x[1]) > 1]
+
+        for i, (label, items) in enumerate(sorted_labels):
+            if i < (self.n_classes // 2):
+                if len(items) >= 10:
+                    self.train_data[label] = items
+                else:
+                    for item in items:
+                        fname = item[0]
+                        bbox = item[1]
+                        self.test_data.append((label, fname, bbox))
+                        self.dict_classes[index] = [label, fname]
+                        index += 1
+                    self.n_test += len(items)
+                    self.n_test_classes += 1
+            else:
+                for item in items:
+                    fname = item[0]
+                    bbox = item[1]
+                    self.test_data.append((label, fname, bbox))
+                    self.dict_classes[index] = [label, fname]
+                    index += 1
+                self.n_test += len(items)
+                self.n_test_classes += 1
+        print("n_test: {}".format(self.n_test))
+        print("n_test_classes: {}".format(self.n_test_classes))
+        # print(self.n_test)
+
+    def sample_train_batch(self):
+        """Sample a training batch (data and label)."""
+        batch = []
+        labels = []
+        num_groups = self.batch_size // self.batch_k
+        # For CUB200, we use the first 100 /2 classes for training.
+        sampled_classes = np.random.choice(list(self.train_data.keys()), num_groups, replace=True)
+        # sampled classes length == num_groups
+        for label in sampled_classes:
+            # pylint: disable=C0326
+            idxs =  np.random.choice(len(self.train_data[label]), self.batch_k, replace=True)
+            for idx in idxs:
+                img_fname, bbox = self.train_data[label][idx]
+                img = self.get_image(img_fname, bbox, is_train=True)
+                batch.append(img)
+                labels.append(label)
+
+        return nd.concatenate(batch, axis=0), labels
+
+    def get_test_batch(self):
+        """Sample a testing batch (data and label)."""
+        batch_size = self.batch_size
+        batch = []
+        labels = []
+        for i in range(batch_size):
+            idx = (self.test_count*batch_size + i) % len(self.test_data)
+            label, img_fname, bbox = self.test_data[idx]
+            img = self.get_image(img_fname, bbox, is_train=False)
+            batch.append(img)
+            labels.append(label)
+
+        return nd.concatenate(batch, axis=0), labels
+
+    def get_image(self, img, bbox, is_train, short_resize=False):
+        """Load and transform an image."""
+        img_arr = mx.image.imread(img)
+        # only when yolo is used as the detector... prob need to make a detection method
+        if short_resize:
+            img_arr = resize_short_within(img_arr.asnumpy(), short=512, max_size=1024, mult_base=32)
+            img_arr = mx.nd.array(img_arr)
+        mult = 256 / 224
+        img_arr = transform(img_arr, int(self.shape*mult), is_train,
+                            bbox, mult, self.rotator, self.crop, self.flip)
+        return img_arr
+
+    def reset(self):
+        """Reset an iterator."""
+        self.test_count = 0
+
+    def next(self):
+        """Return a batch."""
+        if self.is_train:
+            data, labels = self.sample_train_batch()
+        else:
+            if self.test_count * self.batch_size < self.n_test:
+                data, labels = self.get_test_batch()
+                self.test_count += 1
+            else:
+                self.test_count = 0
+                raise StopIteration
+        return mx.io.DataBatch(data=[data], label=[labels])
+
+def beer_iterator_faiss_pickle(data_path, batch_k, batch_size, data_shape, aug_method,
+                               crop=False, flip=False):
+    """Return training and testing iterator for the Beer dataset."""
+    return (BeerIterFaissPickle(data_path, batch_k, batch_size, data_shape,
+                                is_train=True, aug_method=aug_method, crop=crop,
+                                flip=flip),
+            BeerIterFaissPickle(data_path, batch_k, batch_size, data_shape,
+                                is_train=False, aug_method=aug_method, crop=False,
+                                flip=False))
+
+
 def cub200_iterator(data_path, batch_k, batch_size, data_shape):
     """Return training and testing iterator for the CUB200-2011 dataset."""
     return (CUB200Iter(data_path, batch_k, batch_size, data_shape, is_train=True),
             CUB200Iter(data_path, batch_k, batch_size, data_shape, is_train=False))
+
+def cub200_iterator2(data_path, batch_k, batch_size, data_shape):
+    """Return training and testing iterator for the CUB200-2011 dataset."""
+    return (CUB200Iter2(data_path, batch_k, batch_size, data_shape, is_train=True),
+            CUB200Iter2(data_path, batch_k, batch_size, data_shape, is_train=False))
+

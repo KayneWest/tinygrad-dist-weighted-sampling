@@ -4,6 +4,7 @@ pipeline_definition.json
 cub200_data*
 *.npy
 *.png
+*.txt
 
 *pylint*
 *.DS_Store
